@@ -282,97 +282,82 @@ def draw_waypoints(world, waypoints, z=0.5):
         end = begin + carla.Location(x=math.cos(angle), y=math.sin(angle))
         world.debug.draw_arrow(begin, end, arrow_size=0.3, life_time=10.0)
 
-class get_displacement_in_polyline():
-    def __init__(self, loc1, loc2, loc3, wps, distance=5):
-        print("length of wps: ", len(wps))
-        self.initial_position = loc1
-        self.distance = distance
-        self.locs_list = []
-        lc_loc2 = self.translate(loc2, loc1)
-        
-        self.theta = math.atan2(lc_loc2.y, lc_loc2.x)
-        cos_t = math.cos(self.theta)
-        sin_t = math.sin(self.theta)
-        
-        lc_loc = self.transform(loc1)
-        self.locs_list.append(lc_loc)
-        lc_loc = self.transform(loc2)
-        self.locs_list.append(lc_loc)
-        lc_loc = self.transform(loc3)
-        self.locs_list.append(lc_loc)
-        
-        for i in range(len(wps)):
-            lc_loc = self.transform(wps[i].transform.location)
-            self.locs_list.append(lc_loc)
 
-        #self.locs_list = [self.lc_loc1, self.lc_loc2, self.lc_loc3, self.lc_loc4]
+class polyline():
+    def __init__(self, loc1, loc2, loc3, wps, distance=10):
         
-        print(self.locs_list[0].x, self.locs_list[0].y, self.locs_list[0].z)
-        print(self.locs_list[1].x, self.locs_list[1].y, self.locs_list[1].z)
-        print(self.locs_list[2].x, self.locs_list[2].y, self.locs_list[2].z)
-        print(self.locs_list[3].x, self.locs_list[3].y, self.locs_list[3].z)
-        print(self.locs_list[4].x, self.locs_list[4].y, self.locs_list[4].z)
-        print(self.locs_list[5].x, self.locs_list[5].y, self.locs_list[5].z)
-        print(self.locs_list[-1].x, self.locs_list[-1].y, self.locs_list[-1].z)
-        #sys.stop()
+        self.distance = distance
+        self.locs_list = [loc1, loc2, loc3]       
+        for i in range(len(wps)):
+            self.locs_list.append(wps[i].transform.location)
         
         self.nxt_pointer = 1
-        #self.max_pointer = 32
         self.crossed_pointer = 0
 
-    def translate(self, loc, init_loc):
-        return loc - init_loc
-        
+    def translate(self, loc, cu_loc):
+        return loc - cu_loc
+
+    def transform(self, loc, cu_loc, yaw):
+        # first translate
+        tr_loc = self.translate(loc, cu_loc)
+
+        # yaw is angle in positive clockwise directions when looking
+        # in the positive direction of the Z-axis.
+        cos_t = math.cos(math.radians(yaw))
+        sin_t = math.sin(math.radians(yaw))
+     
+        tmp_x = tr_loc.x * cos_t + tr_loc.y * sin_t
+        tmp_y = - tr_loc.x * sin_t + tr_loc.y * cos_t
+        tr_loc.x = tmp_x
+        tr_loc.y = tmp_y
+        return tr_loc
+
+    def transform_locs_list(self, cu_loc, yaw):
+        tr_locs_list = []
+        for i in range(len(self.locs_list)):
+            loc = self.transform(self.locs_list[i], cu_loc, yaw)
+            tr_locs_list.append(loc)
+        return tr_locs_list
    
     def compute_distance(self, loc1, loc2):
         vector = loc1 - loc2
+        # Only distance in x-y axis
         distance = np.sqrt(vector.x**2 + vector.y**2)
         return distance
 
-    def compute_polyline_distance(self, loc, cr_pt, nxt_pt):
+    def compute_polyline_distance(self, cu_loc, yaw, cr_pt, nxt_pt):
+        tr_cu_loc = self.transform(cu_loc, cu_loc, yaw)
+        tr_locs_list = self.transform_locs_list(cu_loc, yaw)
+
         if cr_pt + 1 == nxt_pt:
-            d = self.compute_distance(loc, self.locs_list[nxt_pt])
+            d = self.compute_distance(tr_cu_loc, tr_locs_list[nxt_pt])
         else:
-            d = self.compute_distance(loc, self.locs_list[cr_pt+1])
+            d = self.compute_distance(tr_cu_loc, tr_locs_list[cr_pt+1])
             for pt_idx in range(cr_pt+1, nxt_pt):
-                d += self.compute_distance(self.locs_list[pt_idx], self.locs_list[pt_idx+1])
+                d += self.compute_distance(tr_locs_list[pt_idx], tr_locs_list[pt_idx+1])
         return d
 
-    def find_x_image_on_line(self, crossed_loc, next_loc, cu_loc):
+    def find_x_image_on_line(self, cu_loc, crossed_loc, next_loc):
+        # returns in world coordinates
         m = float(crossed_loc.y - next_loc.y)/float(crossed_loc.x - next_loc.x)
         c = float(crossed_loc.x * next_loc.y - next_loc.x * crossed_loc.y)/float(crossed_loc.x - next_loc.x)
         x = cu_loc.x
         y = m * x + c
         return (x, y)
 
-    def transform(self, loc):
-        local_loc = loc - self.initial_position
-        cos_t = math.cos(self.theta)
-        sin_t = math.sin(self.theta)
-     
-        if self.theta > 0.0 or self.theta < -0.0:
-            tmp_x = local_loc.x * cos_t + local_loc.y * sin_t
-            tmp_y = - local_loc.x * sin_t + local_loc.y * cos_t
-            local_loc.x = tmp_x
-            local_loc.y = tmp_y
-        return local_loc
-
-    def find_point_on_line(self, initial_loc, terminal_loc, distance):
-        v = np.array([initial_loc.x, initial_loc.y], dtype=float)
-        u = np.array([terminal_loc.x, terminal_loc.y], dtype=float)
+    def find_point_on_line(self, cu_loc, yaw, initial_loc, terminal_loc, distance):
+        tr_initial_loc = self.transform(initial_loc, cu_loc, yaw)
+        tr_terminal_loc = self.transform(terminal_loc, cu_loc, yaw)
+        v = np.array([tr_initial_loc.x, tr_initial_loc.y], dtype=float)
+        u = np.array([tr_terminal_loc.x, tr_terminal_loc.y], dtype=float)
         n = v - u
         n /= np.linalg.norm(n, 2)
         point = v - distance * n
-
-        #print("initial loc: ", initial_loc)
-        #print("terminal loc: ", terminal_loc)
-        #print("middle point: ", point)
-
         return tuple(point)
 
 
 def main():
-    data_path = '/home/apoorva/data/test/'
+    data_path = '/home/apoorva/data/lc-town03-polyline/'
     lane_change_number = 0
     BIS = BufferedImageSaver(data_path, 300, 800, 600, 3, 'CameraRGB', lane_change_number)
 
@@ -387,7 +372,7 @@ def main():
 
     client = carla.Client('localhost', 2000)
     client.set_timeout(2.0)
-    world = client.get_world()#load_world('Town04')
+    world = client.get_world()# load_world('Town05') #
     tm = client.get_trafficmanager(3000)
     tm.set_synchronous_mode(True)
     logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.INFO)
@@ -403,7 +388,7 @@ def main():
     try:
         m = world.get_map()
         spawn_points = m.get_spawn_points()
-        start_pose = spawn_points[64] #141
+        start_pose = spawn_points[1] #141
         end_location = random.choice(spawn_points).location 
         #carla.Location(x=-74.650337, y=141.064636, z=0.000000)
         blueprint_library = world.get_blueprint_library()
@@ -414,7 +399,7 @@ def main():
         actor_list.append(vehicle)
         world.player = vehicle
         tm.ignore_lights_percentage(vehicle,100)
-        tm.auto_lane_change(vehicle, True)
+        tm.auto_lane_change(vehicle, False)
         agent = BehaviorAgent(vehicle, ignore_traffic_light=True, behavior='cautious')
        
         agent.set_destination(agent.vehicle.get_location(), end_location,
@@ -496,18 +481,6 @@ def main():
                         obstacle.destroy()
                         obstacle = None
 
-
-                    if controller.print_next_loc:
-                        l1 = vehicle.get_location()
-                        print("current location: ", l1)
-                        w1 = m.get_waypoint(l1)
-                        w2 = list(w1.next(1))[0]
-                        
-                        l2 = w2.transform.location
-                        print("next 1m away loation: ", l2)
-                        print((l2.x-l1.x), (l2.y-l1.y), (l2.z-l1.z))
-                        print((l2.x-l1.x)**2+(l2.y-l1.y)**2+(l2.z-l1.z)**2)
-                        controller.print_next_loc = False
  
                     if controller.force_left_lane_change:
                         print("Left Here")
@@ -533,11 +506,11 @@ def main():
                         wps = [ego_vehicle_wp, ego_vehicle_nxt_wp, left_nxt_nxt_wpt,
                                left_nxt_nxt_nxt_wpts[-1]]                     
                         if left_nxt_wpt is not None:
-                            pl = get_displacement_in_polyline(ego_vehicle_loc,
-                                                              ego_vehicle_nxt_wp.transform.location,
-                                                              left_nxt_nxt_wpt.transform.location,
-                                                              left_nxt_nxt_nxt_wpts,
-                                                              distance=1)
+                            pl = polyline(ego_vehicle_loc,
+                                          ego_vehicle_nxt_wp.transform.location,
+                                          left_nxt_nxt_wpt.transform.location,
+                                          left_nxt_nxt_nxt_wpts,
+                                          distance=10)
                             draw_waypoints(world, wps , z=0.0)
                             polyline_controller = True
 
@@ -564,11 +537,11 @@ def main():
                         wps = [ego_vehicle_wp, ego_vehicle_nxt_wp,
                                right_nxt_nxt_wpt, right_nxt_nxt_nxt_wpts[-1]]
                         if right_nxt_wpt is not None:
-                            pl = get_displacement_in_polyline(ego_vehicle_loc,
-                                                              ego_vehicle_nxt_wp.transform.location,
-                                                              right_nxt_nxt_wpt.transform.location,
-                                                              right_nxt_nxt_nxt_wpts,
-                                                              distance=1)
+                            pl = polyline(ego_vehicle_loc,
+                                          ego_vehicle_nxt_wp.transform.location,
+                                          right_nxt_nxt_wpt.transform.location,
+                                          right_nxt_nxt_nxt_wpts,
+                                          distance=10)
                             draw_waypoints(world, wps , z=0.0)
                             polyline_controller = True
                             
@@ -576,57 +549,50 @@ def main():
                     if controller.autopilot_enabled:
                         if polyline_controller == True:
                             cu_tr = vehicle.get_transform()
-                            # vehicle.bounding_box.extent
-                            # bb_v[4], bb_v[6] are front bottom left and right locations of ego-car. 
-                            bb_v = vehicle.bounding_box.get_world_vertices(cu_tr) 
+                            cu_loc = cu_tr.location # world co-ordinates
+                            yaw = cu_tr.rotation.yaw
+                            local_cu_loc = pl.transform(cu_loc, cu_loc, yaw)
+                            local_locs_list = pl.transform_locs_list(cu_loc, yaw)
 
-                            local_bb_v4 = pl.transform(bb_v[4])
-                            local_bb_v6 = pl.transform(bb_v[6])
-                             
-                            cu_loc = vehicle.get_location() # world co-ordinates
-                            local_cu_loc = pl.transform(cu_loc)
-                            # shifting local_cu_loc from center to front left bottom location
-                            local_cu_loc.x = (local_bb_v4.x+local_bb_v6.x)/2
-                            local_cu_loc.y = (local_bb_v4.y+local_bb_v6.y)/2
-                            local_cu_loc.z = (local_bb_v4.z+local_bb_v6.z)/2
-                            
-                            if local_cu_loc.x >= pl.locs_list[pl.crossed_pointer+1].x:   
+                            # TODO verify this logic                            
+                            if local_locs_list[pl.crossed_pointer + 1].x <= 0:   
                                 pl.crossed_pointer += 1
 
                             d1 = 0
                             while pl.compute_polyline_distance(
-                                local_cu_loc, pl.crossed_pointer, pl.nxt_pointer) <= pl.distance:
+                                cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer) <= pl.distance:
 
                                 if not pl.nxt_pointer == lc_waypoints_count - 1:
                                     # d1 is distance along polyline
                                     d1 = pl.compute_polyline_distance(
-                                        local_cu_loc, pl.crossed_pointer, pl.nxt_pointer)
+                                        cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer)
                                     pl.nxt_pointer += 1
                                     
                                 else:
                                     d1 = pl.compute_polyline_distance(
-                                        local_cu_loc, pl.crossed_pointer, pl.nxt_pointer)
+                                        cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer)
                                     polyline_controller = False
                                     break
 
                             # XXX the ego vehicle may not lie exactly on line
                             gt_point = pl.find_x_image_on_line(
+                                cu_loc,
                                 pl.locs_list[pl.crossed_pointer],
-                                pl.locs_list[pl.crossed_pointer+1], 
-                                local_cu_loc)
+                                pl.locs_list[pl.crossed_pointer+1])
 
                             if d1 == 0:
-                                point = pl.find_point_on_line(local_cu_loc, 
+                                point = pl.find_point_on_line(cu_loc, yaw, cu_loc,
                                                               pl.locs_list[pl.nxt_pointer],
                                                               pl.distance)
                             else:
-                                point = pl.find_point_on_line(pl.locs_list[pl.nxt_pointer - 1],
+                                point = pl.find_point_on_line(cu_loc, yaw,
+                                                              pl.locs_list[pl.nxt_pointer - 1],
                                                               pl.locs_list[pl.nxt_pointer],
                                                               pl.distance - d1)
 
                             dy =  local_cu_loc.y - point[1]
 
-                            steering =  - dy * 0.02
+                            steering =  - dy * 0.05
                             print(dy, steering)
                             control = agent.run_step()
                             control.steer = steering
@@ -635,8 +601,8 @@ def main():
 
                             row = [{'crossed_pointer':pl.crossed_pointer,
                                     'nxt_pointer':pl.nxt_pointer,
-                                    'cu_loc_x':local_cu_loc.x,
-                                    'cu_loc_y':local_cu_loc.y,
+                                    'cu_loc_x':cu_loc.x,
+                                    'cu_loc_y':cu_loc.y,
                                     'gt_x':gt_point[0],
                                     'gt_y':gt_point[1], 
                                     'target_loc_x':point[0],
