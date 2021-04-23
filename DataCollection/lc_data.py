@@ -10,6 +10,7 @@ import glob
 import os
 import sys
 import csv
+import weakref
 
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
@@ -149,7 +150,6 @@ class KeyboardControl(object):
         self.get_waypoint = False
         self.spawn_static_object = False
         self.destroy_static_object = False
-        self.print_next_loc = False
 
     def parse_events(self, clock):
         for event in pygame.event.get():
@@ -201,9 +201,6 @@ class KeyboardControl(object):
                 if event.key == K_g:
                     print("getting waypoint")
                     self.get_waypoint = True
-                if event.key == K_b:
-                    print("print next 1 meter location")
-                    self.print_next_loc = True
 
             if event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
@@ -238,6 +235,35 @@ class KeyboardControl(object):
     def _is_quit_shortcut(key):
         return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
 
+
+# ==============================================================================
+# -- LaneInvasionSensor --------------------------------------------------------
+# ==============================================================================
+
+
+class LaneInvasionSensor(object):
+    def __init__(self, parent_actor):
+        self.sensor = None
+        self._parent = parent_actor
+        #self.hud = hud
+        world = self._parent.get_world()
+        bp = world.get_blueprint_library().find('sensor.other.lane_invasion')
+        self.sensor = world.spawn_actor(bp, carla.Transform(), attach_to=self._parent)
+        # We need to pass the lambda a weak reference to self to avoid circular
+        # reference.
+        weak_self = weakref.ref(self)
+        self.sensor.listen(lambda event: LaneInvasionSensor._on_invasion(weak_self, event))
+
+    @staticmethod
+    def _on_invasion(weak_self, event):
+        self = weak_self()
+        if not self:
+            return
+        lane_types = set(x.type for x in event.crossed_lane_markings)
+        text = ['%r' % str(x).split()[-1] for x in lane_types]
+        #self.hud.notification('Crossed line %s' % ' and '.join(text))
+        print('Crossed line %s' % ' and '.join(text))
+
 # ==============================================================================
 # ------------------------------------------------------------------------------
 # ==============================================================================
@@ -258,6 +284,12 @@ def draw_image2(surface, image, blend=False):
     array = np.reshape(array, (image.height, image.width, 4))
     array = array[:, :, :3]
     array = array[:, :, ::-1]
+    """
+    image_surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+    if blend:
+        image_surface.set_alpha(100)
+    surface.blit(image_surface, (800, 0))
+    """
     return image.raw_data, array
 
 
@@ -358,7 +390,7 @@ class polyline():
 
 def main():
     data_path = '/home/apoorva/data/lc-town03-polyline/'
-    lane_change_number = 0
+    lane_change_number = 10
     BIS = BufferedImageSaver(data_path, 300, 800, 600, 3, 'CameraRGB', lane_change_number)
 
     actor_list = []
@@ -380,16 +412,12 @@ def main():
     num_min_waypoints = 5
     obstacle = None
 
-    csv_filename = '/home/apoorva/lc-data/data.csv'
-
-    fields = ['crossed_pointer', 'nxt_pointer', 'cu_loc_x', 'cu_loc_y', 'gt_x', 'gt_y',
-              'target_loc_x', 'target_loc_y', 'dy', 'steering']
-
     try:
         m = world.get_map()
         spawn_points = m.get_spawn_points()
-        start_pose = spawn_points[1] #141
-        end_location = random.choice(spawn_points).location 
+        start_pose = spawn_points[243] #141
+        end_location = spawn_points[83].location 
+        #random.choice(spawn_points).location 
         #carla.Location(x=-74.650337, y=141.064636, z=0.000000)
         blueprint_library = world.get_blueprint_library()
 
@@ -400,10 +428,10 @@ def main():
         world.player = vehicle
         tm.ignore_lights_percentage(vehicle,100)
         tm.auto_lane_change(vehicle, False)
-        agent = BehaviorAgent(vehicle, ignore_traffic_light=True, behavior='cautious')
-       
-        agent.set_destination(agent.vehicle.get_location(), end_location,
-                              clean=True)
+        agent = BehaviorAgent(vehicle, ignore_traffic_light=True, behavior='cautious')     
+        agent.set_destination(agent.vehicle.get_location(), end_location, clean=True)
+        #lane_invasion_sensor = LaneInvasionSensor(vehicle)
+        #actor_list.append(lane_invasion_sensor.sensor)
 
         camera_rgb = world.spawn_actor(
             blueprint_library.find('sensor.camera.rgb'),
@@ -421,234 +449,200 @@ def main():
         controller = KeyboardControl(world, vehicle, True)
         polyline_controller = False
 
-        with open(csv_filename, 'w') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames = fields)  
-            writer.writeheader()
+        
+        # Create a synchronous mode context.
+        with CarlaSyncMode(world, camera_rgb, camera_top_view, fps=30) as sync_mode:
+            while True:
+                if controller.parse_events(clock):
+                    return
+                agent.update_information(world)
+                clock.tick()
+                # Advance the simulation and wait for the data.
+                snapshot, image_rgb, image_topview = sync_mode.tick(timeout=2.0)
+                # Draw the display.
+                raw, img = draw_image2(display, image_rgb) #draw_image2
+                raw2, img2 = draw_image(display, image_topview)
+                fps = round(1.0 / snapshot.timestamp.delta_seconds)
 
-            # Create a synchronous mode context.
-            with CarlaSyncMode(world, camera_rgb, camera_top_view, fps=30) as sync_mode:
-                while True:
-                    if controller.parse_events(clock):
-                        return
+                if vehicle.is_at_traffic_light():
+                    traffic_light = vehicle.get_traffic_light()
+                    if traffic_light.get_state() == carla.TrafficLightState.Red:
+                        traffic_light.set_state(carla.TrafficLightState.Green)
+                        traffic_light.set_green_time(10.0)
 
-                    agent.update_information(world)
+                # Set new destination when target has been reached
+                if len(agent.get_local_planner().waypoints_queue) < num_min_waypoints:
+                    agent.reroute(spawn_points)
+                    tot_target_reached += 1
+                    print("ReRouting")
 
-                    clock.tick()
-                    # Advance the simulation and wait for the data.
-                    snapshot, image_rgb, image_topview = sync_mode.tick(timeout=2.0)
-                    # Draw the display.
-                    raw, img = draw_image2(display, image_rgb)
-                    raw2, img2 = draw_image(display, image_topview)
-                    fps = round(1.0 / snapshot.timestamp.delta_seconds)
-                    
+                if controller.spawn_static_object:
+                    controller.spawn_static_object = False
+                    ego_vehicle_loc = vehicle.get_location()
+                    ego_vehicle_wp = m.get_waypoint(ego_vehicle_loc)
+                    obstacle_wp = list(ego_vehicle_wp.next(30))[0]
+                    obstacle_location = obstacle_wp.transform.location
+                    obstacle = world.spawn_actor(
+                        random.choice(blueprint_library.filter('vehicle.audi.a2')),
+                        obstacle_wp.transform)
+                    obstacle.set_location(obstacle_location)
+                    obstacle.set_simulate_physics(False)
+                    actor_list.append(obstacle)
+                if obstacle:
+                    ego_vehicle_loc = vehicle.get_location()
+                    vector = ego_vehicle_loc - obstacle_location
+                    distance = np.sqrt(vector.x**2 + vector.y**2 + vector.z**2)
+                    if distance > 27 and distance < 28:
+                        print(distance)
+                else:
+                    distance = 1000
 
-                    if vehicle.is_at_traffic_light():
-                        traffic_light = vehicle.get_traffic_light()
-                        if traffic_light.get_state() == carla.TrafficLightState.Red:
-                            traffic_light.set_state(carla.TrafficLightState.Green)
-                            traffic_light.set_green_time(10.0)
-
-                    # Set new destination when target has been reached
-                    if len(agent.get_local_planner().waypoints_queue) < num_min_waypoints:
-                        agent.reroute(spawn_points)
-                        tot_target_reached += 1
-                        print("ReRouting")
-
-                    if controller.spawn_static_object:
-                        controller.spawn_static_object = False
-                        ego_vehicle_loc = vehicle.get_location()
-                        ego_vehicle_wp = m.get_waypoint(ego_vehicle_loc)
-                        obstacle_wp = list(ego_vehicle_wp.next(30))[0]
-                        obstacle_location = obstacle_wp.transform.location
-                        obstacle = world.spawn_actor(
-                            random.choice(blueprint_library.filter('vehicle.audi.a2')),
-                            obstacle_wp.transform)
-                        obstacle.set_location(obstacle_location)
-                        obstacle.set_simulate_physics(False)
-                        actor_list.append(obstacle)
-  
-                    if obstacle:
-                        ego_vehicle_loc = vehicle.get_location()
-                        vector = ego_vehicle_loc - obstacle_location
-                        distance = np.sqrt(vector.x**2 + vector.y**2 + vector.z**2)
-                        if distance > 27 and distance < 28:
-                            print(distance)
-                    else:
-                        distance = 1000
-
-                    if controller.destroy_static_object:
-                        controller.destroy_static_object = False
-                        obstacle.destroy()
-                        obstacle = None
+                if controller.destroy_static_object:
+                    controller.destroy_static_object = False
+                    obstacle.destroy()
+                    obstacle = None
 
  
-                    if controller.force_left_lane_change:
-                        print("Left Here")
-                        controller.force_left_lane_change = False
-                        ego_vehicle_loc = vehicle.get_location()
-                        ego_vehicle_wp = m.get_waypoint(ego_vehicle_loc)
-                        ego_vehicle_nxt_wp = list(ego_vehicle_wp.next(10))[0]
-                        left_nxt_wpt = ego_vehicle_nxt_wp.get_left_lane()
-                        left_nxt_nxt_wpt = list(left_nxt_wpt.next(15))[0]
-                        
-                        left_nxt_nxt_nxt_wpts = []
-                        for wpt_i in range(30):
-                            if wpt_i == 0:
-                                tmp_wpt = list(left_nxt_nxt_wpt.next(1))[0]
-                            else:
-                                tmp_wpt = list(tmp_wpt.next(1))[0]
-                            left_nxt_nxt_nxt_wpts.append(tmp_wpt)
-                        #left_nxt_nxt_nxt_wpts = list(left_nxt_nxt_wpt.next_until_lane_end(1))#[:30]
-                        len_nxt_nxt_nxt_wpts = min(30, len(left_nxt_nxt_nxt_wpts))
-                        left_nxt_nxt_nxt_wpts = left_nxt_nxt_nxt_wpts[:len_nxt_nxt_nxt_wpts]
+                if controller.force_left_lane_change:
+                    print("Left Here")
+                    controller.force_left_lane_change = False
+                    ego_vehicle_loc = vehicle.get_location()
+                    ego_vehicle_wp = m.get_waypoint(ego_vehicle_loc)
+                    ego_vehicle_nxt_wp = list(ego_vehicle_wp.next(10))[0]
+                    left_nxt_wpt = ego_vehicle_nxt_wp.get_left_lane()
+                    left_nxt_nxt_wpt = list(left_nxt_wpt.next(15))[0]
+                      
+                    left_nxt_nxt_nxt_wpts = []
+                    for wpt_i in range(60):
+                        if wpt_i == 0:
+                            tmp_wpt = list(left_nxt_nxt_wpt.next(1))[0]
+                        else:
+                            tmp_wpt = list(tmp_wpt.next(1))[0]
+                        left_nxt_nxt_nxt_wpts.append(tmp_wpt)
+                    len_nxt_nxt_nxt_wpts = min(60, len(left_nxt_nxt_nxt_wpts))
+                    left_nxt_nxt_nxt_wpts = left_nxt_nxt_nxt_wpts[:len_nxt_nxt_nxt_wpts]
+                    lc_waypoints_count = 3 + len_nxt_nxt_nxt_wpts  
+                    wps = [ego_vehicle_wp, ego_vehicle_nxt_wp, left_nxt_nxt_wpt,
+                           left_nxt_nxt_nxt_wpts[-1]]                     
+                    if left_nxt_wpt is not None:
+                        pl = polyline(ego_vehicle_loc,
+                                      ego_vehicle_nxt_wp.transform.location,
+                                      left_nxt_nxt_wpt.transform.location,
+                                      left_nxt_nxt_nxt_wpts,
+                                      distance=10)
+                        #draw_waypoints(world, wps , z=0.0)
+                        polyline_controller = True
 
-                        lc_waypoints_count = 3 + len_nxt_nxt_nxt_wpts  
-                        wps = [ego_vehicle_wp, ego_vehicle_nxt_wp, left_nxt_nxt_wpt,
-                               left_nxt_nxt_nxt_wpts[-1]]                     
-                        if left_nxt_wpt is not None:
-                            pl = polyline(ego_vehicle_loc,
-                                          ego_vehicle_nxt_wp.transform.location,
-                                          left_nxt_nxt_wpt.transform.location,
-                                          left_nxt_nxt_nxt_wpts,
-                                          distance=10)
-                            draw_waypoints(world, wps , z=0.0)
-                            polyline_controller = True
-
-                    if controller.force_right_lane_change:
-                        print("Right Here")
-                        controller.force_right_lane_change = False
-                        ego_vehicle_loc = vehicle.get_location()
-                        ego_vehicle_wp = m.get_waypoint(ego_vehicle_loc)
-                        ego_vehicle_nxt_wp = list(ego_vehicle_wp.next(10))[0]
-                        right_nxt_wpt = ego_vehicle_nxt_wp.get_right_lane()
-                        right_nxt_nxt_wpt = list(right_nxt_wpt.next(15))[0]
-                        right_nxt_nxt_nxt_wpts = []
-                        for wpt_i in range(30):
-                            if wpt_i == 0:
-                                tmp_wpt = list(right_nxt_nxt_wpt.next(1))[0]
-                            else:
-                                tmp_wpt = list(tmp_wpt.next(1))[0]
-                            right_nxt_nxt_nxt_wpts.append(tmp_wpt)
-                        #right_nxt_nxt_nxt_wpts = list(right_nxt_nxt_wpt.next_until_lane_end(1))#[:30]
-                        len_nxt_nxt_nxt_wpts = min(30, len(right_nxt_nxt_nxt_wpts))
-                        right_nxt_nxt_nxt_wpts = right_nxt_nxt_nxt_wpts[:len_nxt_nxt_nxt_wpts]
-                        lc_waypoints_count = 3 + len_nxt_nxt_nxt_wpts
-                        
-                        wps = [ego_vehicle_wp, ego_vehicle_nxt_wp,
-                               right_nxt_nxt_wpt, right_nxt_nxt_nxt_wpts[-1]]
-                        if right_nxt_wpt is not None:
-                            pl = polyline(ego_vehicle_loc,
-                                          ego_vehicle_nxt_wp.transform.location,
-                                          right_nxt_nxt_wpt.transform.location,
-                                          right_nxt_nxt_nxt_wpts,
-                                          distance=10)
-                            draw_waypoints(world, wps , z=0.0)
-                            polyline_controller = True
+                if controller.force_right_lane_change:
+                    print("Right Here")
+                    controller.force_right_lane_change = False
+                    ego_vehicle_loc = vehicle.get_location()
+                    ego_vehicle_wp = m.get_waypoint(ego_vehicle_loc)
+                    ego_vehicle_nxt_wp = list(ego_vehicle_wp.next(10))[0]
+                    right_nxt_wpt = ego_vehicle_nxt_wp.get_right_lane()
+                    right_nxt_nxt_wpt = list(right_nxt_wpt.next(15))[0]
+                    right_nxt_nxt_nxt_wpts = []
+                    for wpt_i in range(60):
+                        if wpt_i == 0:
+                            tmp_wpt = list(right_nxt_nxt_wpt.next(1))[0]
+                        else:
+                            tmp_wpt = list(tmp_wpt.next(1))[0]
+                        right_nxt_nxt_nxt_wpts.append(tmp_wpt)                        
+                    len_nxt_nxt_nxt_wpts = min(60, len(right_nxt_nxt_nxt_wpts))
+                    right_nxt_nxt_nxt_wpts = right_nxt_nxt_nxt_wpts[:len_nxt_nxt_nxt_wpts]
+                    lc_waypoints_count = 3 + len_nxt_nxt_nxt_wpts                        
+                    wps = [ego_vehicle_wp, ego_vehicle_nxt_wp,
+                           right_nxt_nxt_wpt, right_nxt_nxt_nxt_wpts[-1]]
+                    if right_nxt_wpt is not None:
+                        pl = polyline(ego_vehicle_loc,
+                                      ego_vehicle_nxt_wp.transform.location,
+                                      right_nxt_nxt_wpt.transform.location,
+                                      right_nxt_nxt_nxt_wpts,
+                                      distance=10)
+                        #draw_waypoints(world, wps , z=0.0)
+                        polyline_controller = True
                             
 
-                    if controller.autopilot_enabled:
-                        if polyline_controller == True:
-                            cu_tr = vehicle.get_transform()
-                            cu_loc = cu_tr.location # world co-ordinates
-                            yaw = cu_tr.rotation.yaw
-                            local_cu_loc = pl.transform(cu_loc, cu_loc, yaw)
-                            local_locs_list = pl.transform_locs_list(cu_loc, yaw)
+                if controller.autopilot_enabled:
+                    if polyline_controller == True:
+                        cu_tr = vehicle.get_transform()
+                        cu_loc = cu_tr.location # world co-ordinates
+                        yaw = cu_tr.rotation.yaw
+                        local_cu_loc = pl.transform(cu_loc, cu_loc, yaw)
+                        local_locs_list = pl.transform_locs_list(cu_loc, yaw)
 
-                            # TODO verify this logic                            
-                            if local_locs_list[pl.crossed_pointer + 1].x <= 0:   
-                                pl.crossed_pointer += 1
-
-                            d1 = 0
-                            while pl.compute_polyline_distance(
-                                cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer) <= pl.distance:
-
-                                if not pl.nxt_pointer == lc_waypoints_count - 1:
-                                    # d1 is distance along polyline
-                                    d1 = pl.compute_polyline_distance(
-                                        cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer)
-                                    pl.nxt_pointer += 1
+                        # TODO verify this logic                            
+                        if local_locs_list[pl.crossed_pointer + 1].x <= 0:   
+                            pl.crossed_pointer += 1
+                        d1 = 0
+                        while pl.compute_polyline_distance(
+                            cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer) <= pl.distance:
+                            if not pl.nxt_pointer == lc_waypoints_count - 1:
+                                # d1 is distance along polyline
+                                d1 = pl.compute_polyline_distance(
+                                    cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer)
+                                pl.nxt_pointer += 1
                                     
-                                else:
-                                    d1 = pl.compute_polyline_distance(
-                                        cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer)
-                                    polyline_controller = False
-                                    break
-
-                            # XXX the ego vehicle may not lie exactly on line
-                            gt_point = pl.find_x_image_on_line(
-                                cu_loc,
-                                pl.locs_list[pl.crossed_pointer],
-                                pl.locs_list[pl.crossed_pointer+1])
-
-                            if d1 == 0:
-                                point = pl.find_point_on_line(cu_loc, yaw, cu_loc,
-                                                              pl.locs_list[pl.nxt_pointer],
-                                                              pl.distance)
                             else:
-                                point = pl.find_point_on_line(cu_loc, yaw,
-                                                              pl.locs_list[pl.nxt_pointer - 1],
-                                                              pl.locs_list[pl.nxt_pointer],
-                                                              pl.distance - d1)
+                                d1 = pl.compute_polyline_distance(
+                                    cu_loc, yaw, pl.crossed_pointer, pl.nxt_pointer)
+                                polyline_controller = False
+                                break
+                        # The ego vehicle may not lie exactly on line
+                        gt_point = pl.find_x_image_on_line(
+                            cu_loc,
+                            pl.locs_list[pl.crossed_pointer],
+                            pl.locs_list[pl.crossed_pointer+1])
 
-                            dy =  local_cu_loc.y - point[1]
-
-                            steering =  - dy * 0.05
-                            print(dy, steering)
-                            control = agent.run_step()
-                            control.steer = steering
-                            vehicle.apply_control(control)
-                            control_values = vehicle.get_control()
-
-                            row = [{'crossed_pointer':pl.crossed_pointer,
-                                    'nxt_pointer':pl.nxt_pointer,
-                                    'cu_loc_x':cu_loc.x,
-                                    'cu_loc_y':cu_loc.y,
-                                    'gt_x':gt_point[0],
-                                    'gt_y':gt_point[1], 
-                                    'target_loc_x':point[0],
-                                    'target_loc_y':point[1], 
-                                    'dy':dy,
-                                    'steering':steering}]
-                            writer.writerows(row)
-
+                        if d1 == 0:
+                            point = pl.find_point_on_line(cu_loc, yaw, cu_loc,
+                                                          pl.locs_list[pl.nxt_pointer],
+                                                          pl.distance)
                         else:
-                            control = agent.run_step()
-                            #control.throttle = 0.5 * control.throttle
-                            vehicle.apply_control(control)
-                            control_values = vehicle.get_control()
+                            point = pl.find_point_on_line(cu_loc, yaw,
+                                                          pl.locs_list[pl.nxt_pointer - 1],
+                                                          pl.locs_list[pl.nxt_pointer],
+                                                          pl.distance - d1)
 
-                    if controller.get_waypoint:
-                        location = vehicle.get_location()
-                        ego_vehicle_wp = m.get_waypoint(location)
-                        next_loc = list(ego_vehicle_wp.next(10))[0].transform.location
-                        vehicle.set_location(next_loc)
-                        controller.get_waypoint = False
- 
-                    v = vehicle.get_velocity()
-   
-                    display.blit(
-                        font.render('% 5d FPS (real)' % clock.get_fps(), True, (255, 255, 255)), (8, 10))
-                    display.blit(
-                        font.render('% 5d FPS (simulated)' % fps, True, (255, 255, 255)), (8, 28))
-                    display.blit(
-                        font.render('% 5f speed (ego-car)' % (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)), True, (255, 255, 255)),
-                        (8, 48))
-                    pygame.display.flip()
+                        dy =  local_cu_loc.y - point[1]
+                        steering =  - dy * 0.05
+                        control = agent.run_step()
+                        control.steer = steering
+                        vehicle.apply_control(control)
+                    else:
+                        control = agent.run_step()
+                        vehicle.apply_control(control)
+                           
 
+                if controller.get_waypoint:
+                    location = vehicle.get_location()
+                    ego_vehicle_wp = m.get_waypoint(location)
+                    next_loc = list(ego_vehicle_wp.next(10))[0].transform.location
+                    vehicle.set_location(next_loc)
+                    controller.get_waypoint = False
+                v = vehicle.get_velocity()   
+                display.blit(
+                    font.render('% 5d FPS (real)' % clock.get_fps(), True, (255, 255, 255)), (8, 10))
+                display.blit(
+                    font.render('% 5d FPS (simulated)' % fps, True, (255, 255, 255)), (8, 28))
+                display.blit(
+                    font.render('% 5f speed (ego-car)' % (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)), True, (255, 255, 255)), (8, 48))
+                display.blit(
+                    font.render('% 5f steering ' % control.steer, True, (255, 255, 255)), (8, 68))
+                pygame.display.flip()
+    
 
-                    
-
-                    if controller.start_data_collection:
-                        if BIS.index % 50 == 0:
-                            print(BIS.index)
-                        BIS.add_image(raw,
-                                      control_values.steer,
-                                      controller.left_lane_change_activated,
-                                      controller.right_lane_change_activated,
-                                      controller.lane_change_second_half,
-                                      controller.junk,
-                                      distance,
-                                      'CameraRGB')
+                if controller.start_data_collection:
+                    if BIS.index % 50 == 0:
+                        print(BIS.index)
+                    BIS.add_image(raw,
+                                  control.steer,
+                                  controller.left_lane_change_activated,
+                                  controller.right_lane_change_activated,
+                                  controller.lane_change_second_half,
+                                  controller.junk,
+                                  distance,
+                                  'CameraRGB')
 
     finally:
         print('destroying actors.')
